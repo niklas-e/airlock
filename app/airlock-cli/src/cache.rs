@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 /// On-disk format version for the per-layer cache. Bumped whenever the
-/// on-disk contract changes (e.g. the extractor now sets
-/// `user.overlay.opaque="x"` on parent dirs of xattr whiteouts; layers
-/// produced without that mark can't be reused). Every layer dir and
-/// staging file is prefixed with `{LAYER_FORMAT}.`, and the image JSON
-/// schema is bumped in lockstep so stale caches are ignored instead of
-/// silently poisoning fresh runs.
-pub const LAYER_FORMAT: u32 = 2;
+/// on-disk contract changes (2: the extractor sets `user.overlay.opaque="x"`
+/// on parent dirs of xattr whiteouts; 3: layers are keyed by diff ID, the
+/// digest of the uncompressed tar, instead of the compressed blob digest).
+/// Every layer dir and staging file is prefixed with `{LAYER_FORMAT}.`, and
+/// the image JSON schema is bumped in lockstep so stale caches are ignored
+/// instead of silently poisoning fresh runs.
+pub const LAYER_FORMAT: u32 = 3;
 
 /// Shared lock for tests that mutate the process-wide `HOME` env var.
 /// Any test that calls `std::env::set_var("HOME", …)` to redirect the
@@ -33,13 +33,15 @@ pub fn digest_name(digest: &str) -> &str {
     digest.split(':').next_back().unwrap_or(digest)
 }
 
-/// Normalize an OCI digest into the versioned layer key used as both the
+/// Normalize a layer diff ID into the versioned layer key used as both the
 /// on-disk directory name and the identifier passed to the guest (so guest
-/// mount paths match host paths). Embedding [`LAYER_FORMAT`] into every
-/// layer name means a format bump automatically invalidates the old cache
-/// without needing to locate and wipe it — old dirs stay around until
-/// [`crate::oci::gc_sweep`] reaps them, but they're ignored by anything
-/// that consults the cache.
+/// mount paths match host paths). Keying by diff ID rather than by the
+/// compressed blob digest means the same layer is one cache entry whether
+/// it arrived from a registry pull or a docker/podman export. Embedding
+/// [`LAYER_FORMAT`] into every layer name means a format bump automatically
+/// invalidates the old cache without needing to locate and wipe it — old
+/// dirs stay around until [`crate::oci::gc_sweep`] reaps them, but they're
+/// ignored by anything that consults the cache.
 pub fn layer_key(digest: &str) -> String {
     format!("{LAYER_FORMAT}.{}", digest_name(digest))
 }

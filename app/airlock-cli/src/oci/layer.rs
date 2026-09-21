@@ -1,7 +1,8 @@
 //! OCI image layer download + extraction, staged through the per-layer cache.
 //!
 //! A layer moves through three on-disk states under
-//! `~/.cache/airlock/oci/layers/`:
+//! `~/.cache/airlock/oci/layers/`, keyed by its diff ID (the digest of the
+//! uncompressed tar):
 //!
 //! ```text
 //! <digest>.download.tmp   # in-flight download
@@ -19,6 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use indicatif::ProgressBar;
+use sha2::{Digest, Sha256};
 
 use crate::cache;
 
@@ -36,6 +38,10 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// Ensure a layer is extracted into the shared cache, downloading the
 /// tarball through `fetch` only if it's not already on disk.
+///
+/// `digest` is the layer's diff ID. The uncompressed stream is hashed while
+/// extracting and must match it before the layer dir is committed, so no
+/// source can plant content under another layer's key.
 ///
 /// - Fast path: `<digest>/` exists → return immediately. The directory
 ///   only becomes visible via the atomic rename at the end of extraction,
@@ -92,7 +98,7 @@ where
         std::fs::rename(&download_tmp, &download)?;
     }
 
-    extract_tarball_to_cache(&layer_dir, &download, progress)?;
+    extract_tarball_to_cache(&layer_dir, &download, digest, progress)?;
     let _ = std::fs::remove_file(&download);
     if let Some(pb) = progress {
         pb.set_message("ready");
@@ -115,6 +121,7 @@ where
 fn extract_tarball_to_cache(
     layer_dir: &Path,
     tarball: &Path,
+    digest: &str,
     progress: Option<&ProgressBar>,
 ) -> anyhow::Result<()> {
     let parent = layer_dir
@@ -161,7 +168,10 @@ fn extract_tarball_to_cache(
     } else {
         Box::new(head.chain(reader))
     };
-    let mut archive = tar::Archive::new(body);
+    let mut archive = tar::Archive::new(HashingReader {
+        inner: body,
+        hasher: Sha256::new(),
+    });
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -229,6 +239,17 @@ fn extract_tarball_to_cache(
         // and — critically — rewrites hardlink targets to stay inside it, so
         // `ln /absolute/host/path /extract/root/foo` never happens.
         entry.unpack_in(&tmp)?;
+    }
+
+    // The diff ID covers the whole stream, including the end-of-archive
+    // padding the tar reader stops short of.
+    let mut body = archive.into_inner();
+    std::io::copy(&mut body, &mut std::io::sink())?;
+    let actual = hex::encode(body.hasher.finalize());
+    if !actual.eq_ignore_ascii_case(cache::digest_name(digest)) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(tarball);
+        anyhow::bail!("layer {digest} content hashes to sha256:{actual}");
     }
 
     // Commit via atomic rename. The fast path in `ensure_layer_cached`
@@ -310,34 +331,34 @@ impl<R: Read> Read for ProgressReader<R> {
     }
 }
 
+/// `Read` wrapper that feeds every byte through SHA-256, so the extractor
+/// can check the decompressed stream against the layer's diff ID.
+struct HashingReader<R: Read> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::io::Write;
+
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
     use super::*;
     use crate::cache::HOME_LOCK;
 
-    /// Build a tiny gzipped tar from in-memory `(path, content)` entries.
-    /// Paths starting with `.wh.` represent whiteouts; content is ignored.
-    fn build_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
-        {
-            let mut b = tar::Builder::new(&mut gz);
-            for (path, content) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(content.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                b.append_data(&mut header, path, *content).unwrap();
-            }
-            b.finish().unwrap();
-        }
-        gz.finish().unwrap()
-    }
-
-    /// Build a plain (uncompressed) tar — mirrors what `docker image save`
-    /// emits with the classic driver.
+    /// Build a plain tar from in-memory `(path, content)` entries — what
+    /// `docker image save` emits with the classic driver. Paths starting
+    /// with `.wh.` represent whiteouts; content is ignored.
     fn build_plain_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
@@ -352,6 +373,26 @@ mod tests {
             b.finish().unwrap();
         }
         buf
+    }
+
+    /// Gzip a tar the way registries store layer blobs.
+    fn gzip(tar: &[u8]) -> Vec<u8> {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        gz.write_all(tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// The diff ID of a plain tar: what a layer is keyed and verified by.
+    fn diff_id(tar: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(Sha256::digest(tar)))
+    }
+
+    /// Write a gzipped layer under `tmp` and return its path and diff ID.
+    fn stage_gz(tmp: &Path, entries: &[(&str, &[u8])]) -> (PathBuf, String) {
+        let tar = build_plain_tarball(entries);
+        let path = tmp.join("layer.tar.gz");
+        std::fs::write(&path, gzip(&tar)).unwrap();
+        (path, diff_id(&tar))
     }
 
     fn fetch_from(src: PathBuf) -> impl FnOnce(&Path) -> anyhow::Result<()> {
@@ -370,16 +411,10 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let tarball = tmp.join("layer.tar.gz");
-        std::fs::write(
-            &tarball,
-            build_tarball(&[("etc/hello", b"world"), ("bin/sh", b"#!/bin/sh\n")]),
-        )
-        .unwrap();
-
-        let layer = ensure_layer_cached("sha256:deadbeef1", fetch_from(tarball), None)
+        let (tarball, digest) =
+            stage_gz(&tmp, &[("etc/hello", b"world"), ("bin/sh", b"#!/bin/sh\n")]);
+        let layer = ensure_layer_cached(&digest, fetch_from(tarball), None)
             .expect("extract should succeed");
-
         assert_eq!(std::fs::read(layer.join("etc/hello")).unwrap(), b"world");
         assert!(layer.join("bin/sh").exists());
     }
@@ -393,15 +428,8 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let tarball = tmp.join("layer.tar.gz");
-        std::fs::write(
-            &tarball,
-            build_tarball(&[("etc/keep", b"k"), ("etc/.wh.gone", b"")]),
-        )
-        .unwrap();
-
-        let layer = ensure_layer_cached("sha256:deadbeef2", fetch_from(tarball), None).unwrap();
-
+        let (tarball, digest) = stage_gz(&tmp, &[("etc/keep", b"k"), ("etc/.wh.gone", b"")]);
+        let layer = ensure_layer_cached(&digest, fetch_from(tarball), None).unwrap();
         let whiteout = layer.join("etc/gone");
         assert!(whiteout.exists(), "whiteout placeholder file must exist");
         assert_eq!(std::fs::metadata(&whiteout).unwrap().len(), 0);
@@ -424,15 +452,11 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let tarball = tmp.join("layer.tar.gz");
-        std::fs::write(
-            &tarball,
-            build_tarball(&[("opt/app/.wh..wh..opq", b""), ("opt/app/new", b"n")]),
-        )
-        .unwrap();
-
-        let layer = ensure_layer_cached("sha256:deadbeef3", fetch_from(tarball), None).unwrap();
-
+        let (tarball, digest) = stage_gz(
+            &tmp,
+            &[("opt/app/.wh..wh..opq", b""), ("opt/app/new", b"n")],
+        );
+        let layer = ensure_layer_cached(&digest, fetch_from(tarball), None).unwrap();
         let opaque_dir = layer.join("opt/app");
         let val = xattr::get(&opaque_dir, "user.overlay.opaque").unwrap();
         assert_eq!(val.as_deref(), Some(b"y" as &[u8]));
@@ -448,16 +472,12 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let tarball = tmp.join("layer.tar.gz");
-        std::fs::write(&tarball, build_tarball(&[("a", b"1")])).unwrap();
-
-        let first =
-            ensure_layer_cached("sha256:deadbeef4", fetch_from(tarball.clone()), None).unwrap();
+        let (tarball, digest) = stage_gz(&tmp, &[("a", b"1")]);
+        let first = ensure_layer_cached(&digest, fetch_from(tarball.clone()), None).unwrap();
         let mtime = std::fs::metadata(&first).unwrap().modified().unwrap();
-
         // Second call: <digest>/ exists, fetch must not be called.
         let second = ensure_layer_cached(
-            "sha256:deadbeef4",
+            &digest,
             |_| panic!("fetch must not be called when <digest>/ exists"),
             None,
         )
@@ -495,11 +515,37 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
+        let tar = build_plain_tarball(&[("etc/plain", b"ok")]);
         let tarball = tmp.join("layer.tar");
-        std::fs::write(&tarball, build_plain_tarball(&[("etc/plain", b"ok")])).unwrap();
-
-        let layer = ensure_layer_cached("sha256:deadbeef7", fetch_from(tarball), None).unwrap();
+        std::fs::write(&tarball, &tar).unwrap();
+        let layer = ensure_layer_cached(&diff_id(&tar), fetch_from(tarball), None).unwrap();
         assert_eq!(std::fs::read(layer.join("etc/plain")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn ensure_layer_cached_rejects_content_not_matching_digest() {
+        // The cross-source poisoning guard: whatever staged the tarball, its
+        // decompressed bytes must hash to the key it is about to live under.
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let (tarball, _) = stage_gz(&tmp, &[("a", b"1")]);
+        let claimed = format!("sha256:{}", "a".repeat(64));
+        let err = ensure_layer_cached(&claimed, fetch_from(tarball), None).unwrap_err();
+        assert!(
+            err.to_string().contains("hashes to"),
+            "unexpected error: {err}"
+        );
+        let key = cache::layer_key(&claimed);
+        assert!(!cache::layer_dir(&key).unwrap().exists());
+        let download = cache::layers_root()
+            .unwrap()
+            .join(format!("{key}.download"));
+        assert!(!download.exists(), "rejected tarball must not stay staged");
     }
 
     #[test]
@@ -511,21 +557,20 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let digest = "sha256:deadbeef5";
+        let tar = build_plain_tarball(&[("staged", b"yes")]);
+        let digest = diff_id(&tar);
         // Pre-stage a complete tarball at <key>.download as if a previous
         // process had downloaded it but crashed before extraction.
         let layers_root = cache::layers_root().unwrap();
-        let key = cache::layer_key(digest);
+        let key = cache::layer_key(&digest);
         let download = layers_root.join(format!("{key}.download"));
-        std::fs::write(&download, build_tarball(&[("staged", b"yes")])).unwrap();
-
+        std::fs::write(&download, gzip(&tar)).unwrap();
         let layer = ensure_layer_cached(
-            digest,
+            &digest,
             |_| panic!("fetch must not be called when .download exists"),
             None,
         )
         .unwrap();
-
         assert!(layer.join("staged").exists());
         assert!(!download.exists(), "staged tarball removed after extract");
     }
@@ -539,16 +584,12 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-        let digest = "sha256:deadbeef6";
+        let (tarball, digest) = stage_gz(&tmp, &[("ok", b"yes")]);
         let layers_root = cache::layers_root().unwrap();
-        let key = cache::layer_key(digest);
+        let key = cache::layer_key(&digest);
         let stale = layers_root.join(format!("{key}.download.tmp"));
         std::fs::write(&stale, b"partial garbage").unwrap();
-
-        let tarball_src = tmp.join("layer.tar.gz");
-        std::fs::write(&tarball_src, build_tarball(&[("ok", b"yes")])).unwrap();
-
-        let layer = ensure_layer_cached(digest, fetch_from(tarball_src), None).unwrap();
+        let layer = ensure_layer_cached(&digest, fetch_from(tarball), None).unwrap();
         assert!(layer.join("ok").exists());
         assert!(!stale.exists());
     }
@@ -565,22 +606,15 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-
-        let key = cache::layer_key("sha256:winnerdir");
-        let layer_dir = cache::layer_dir(&key).unwrap();
+        let (tarball, digest) = stage_gz(&tmp, &[("loser", b"x")]);
+        let layer_dir = cache::layer_dir(&cache::layer_key(&digest)).unwrap();
         std::fs::create_dir_all(&layer_dir).unwrap();
         std::fs::write(layer_dir.join("winner"), b"kept").unwrap();
-
-        let tarball = tmp.join("layer.tar.gz");
-        std::fs::write(&tarball, build_tarball(&[("loser", b"x")])).unwrap();
-
-        extract_tarball_to_cache(&layer_dir, &tarball, None)
+        extract_tarball_to_cache(&layer_dir, &tarball, &digest, None)
             .expect("reuse must succeed when the winner dir already exists");
-
         // Winner's tree is untouched; our entry was not committed over it.
         assert_eq!(std::fs::read(layer_dir.join("winner")).unwrap(), b"kept");
         assert!(!layer_dir.join("loser").exists());
-
         // No staging dir left behind.
         let parent = layer_dir.parent().unwrap();
         let stray: Vec<_> = std::fs::read_dir(parent)
@@ -626,7 +660,6 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &tmp);
         }
-
         // A sentinel host file outside the extraction root. A whiteout that
         // follows a planted symlink would `remove_file` it.
         let outside = tmp.join("outside");
@@ -635,9 +668,9 @@ mod tests {
 
         // Malicious layer: plant `esc -> <outside>`, then whiteout
         // `esc/.wh.victim` to try to delete `<outside>/victim`.
-        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut tar = Vec::new();
         {
-            let mut b = tar::Builder::new(&mut gz);
+            let mut b = tar::Builder::new(&mut tar);
             let mut link = tar::Header::new_gnu();
             link.set_entry_type(tar::EntryType::Symlink);
             link.set_size(0);
@@ -649,11 +682,10 @@ mod tests {
             b.append_data(&mut wh, "esc/.wh.victim", &b""[..]).unwrap();
             b.finish().unwrap();
         }
-        let buf = gz.finish().unwrap();
         let tarball = tmp.join("evil.tar.gz");
-        std::fs::write(&tarball, buf).unwrap();
+        std::fs::write(&tarball, gzip(&tar)).unwrap();
 
-        let _ = ensure_layer_cached("sha256:evil1", fetch_from(tarball), None);
+        let _ = ensure_layer_cached(&diff_id(&tar), fetch_from(tarball), None);
 
         // The security invariant: the file outside the root is untouched,
         // regardless of whether extraction errored or contained the whiteout.

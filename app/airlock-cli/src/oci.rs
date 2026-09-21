@@ -42,9 +42,9 @@ pub struct OciImage {
     /// configured image name without re-resolving the tag.
     pub name: String,
     /// Ordered layer keys — topmost-first. Each entry is a versioned layer
-    /// name ([`cache::layer_key`]), matching both the on-disk directory name
-    /// under `~/.cache/airlock/oci/layers/<key>` and the guest mount path
-    /// `/mnt/layers/<key>`.
+    /// name ([`cache::layer_key`] of the layer's diff ID), matching both the
+    /// on-disk directory name under `~/.cache/airlock/oci/layers/<key>` and
+    /// the guest mount path `/mnt/layers/<key>`.
     pub image_layers: Vec<String>,
     /// Container home directory derived from the image's user record
     /// (e.g. `/root`). For guest-path `~` expansion the
@@ -285,15 +285,15 @@ async fn resolve_with_auth(
 }
 
 /// On-disk wrapper for a cached [`OciImage`]. Internally tagged so the JSON
-/// carries `"schema":"v2"` alongside the image fields. The schema version
+/// carries `"schema":"v3"` alongside the image fields. The schema version
 /// is bumped in lockstep with [`crate::cache::LAYER_FORMAT`] so a layer
 /// format change makes every old image JSON fail to deserialize and force
 /// a clean re-pull.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "schema")]
 enum CachedImage {
-    #[serde(rename = "v2")]
-    V2(OciImage),
+    #[serde(rename = "v3")]
+    V3(OciImage),
 }
 
 /// Read a cached image JSON file and unwrap it into an [`OciImage`]. Returns
@@ -302,7 +302,7 @@ enum CachedImage {
 fn read_cached_image(path: &Path) -> Option<OciImage> {
     let data = std::fs::read(path).ok()?;
     let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
-    let CachedImage::V2(image) = wrapped;
+    let CachedImage::V3(image) = wrapped;
     Some(image)
 }
 
@@ -368,7 +368,7 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
+    let bytes = serde_json::to_vec_pretty(&CachedImage::V3(image.clone()))?;
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -926,19 +926,31 @@ async fn ensure_local_image(
 
 /// Pull-and-extract for registry-sourced images. Layer downloads run
 /// concurrently (bounded); each layer is streamed to its
-/// `<digest>.download.tmp` path and extracted through the shared per-layer
-/// cache. Returns layer digests in topmost-first order.
+/// `<diff-id>.download.tmp` path and extracted through the shared per-layer
+/// cache. Returns layer keys in topmost-first order.
+///
+/// The manifest names layers by compressed blob digest, which is what the
+/// download is verified against. The cache is keyed by diff ID, which the
+/// image config lists in the same order, so a layer already exported from
+/// docker/podman is a cache hit here too.
 async fn ensure_registry_image(
     reg: &registry::RegistryImage,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<Vec<String>> {
     let layers = &reg.manifest.layers;
+    let diff_ids = &reg.image_config.rootfs.diff_ids;
+    if diff_ids.len() != layers.len() {
+        anyhow::bail!(
+            "image config lists {} diff IDs for {} manifest layers",
+            diff_ids.len(),
+            layers.len()
+        );
+    }
+    let is_cached =
+        |i: usize| cache::layer_dir(&cache::layer_key(&diff_ids[i])).is_ok_and(|p| p.is_dir());
 
-    let cached_count = layers
-        .iter()
-        .filter(|l| cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
-        .count();
+    let cached_count = (0..layers.len()).filter(|&i| is_cached(i)).count();
     if cached_count > 0 {
         cli::log!(
             "  {} {} of {} layers found from cache",
@@ -948,12 +960,7 @@ async fn ensure_registry_image(
         );
     }
 
-    let to_fetch: Vec<usize> = layers
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| !cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
-        .map(|(i, _)| i)
-        .collect();
+    let to_fetch: Vec<usize> = (0..layers.len()).filter(|&i| !is_cached(i)).collect();
 
     if !to_fetch.is_empty() {
         let mp = cli::multi_progress();
@@ -982,7 +989,15 @@ async fn ensure_registry_image(
                 .map(|i| async move {
                     let layer_desc = &layers[i];
                     let per_layer = &bars_ref[i];
-                    fetch_and_extract_layer(reference, layer_desc, per_layer, auth, insecure).await
+                    fetch_and_extract_layer(
+                        reference,
+                        layer_desc,
+                        &diff_ids[i],
+                        per_layer,
+                        auth,
+                        insecure,
+                    )
+                    .await
                 })
                 .buffer_unordered(3);
 
@@ -1014,23 +1029,24 @@ async fn ensure_registry_image(
     }
 
     // OCI manifests list layers bottom→top; overlayfs wants topmost first.
-    let mut ordered: Vec<String> = layers.iter().map(|l| cache::layer_key(&l.digest)).collect();
+    let mut ordered: Vec<String> = diff_ids.iter().map(|d| cache::layer_key(d)).collect();
     ordered.reverse();
     Ok(ordered)
 }
 
-/// Download one layer blob into `<digest>.download.tmp` and extract it
+/// Download one layer blob into `<diff-id>.download.tmp` and extract it
 /// through the shared per-layer cache. `ensure_layer_cached` is a no-op
 /// when the layer dir already exists, so the `to_fetch` filter in the
 /// caller is a latency optimization, not a correctness requirement.
 async fn fetch_and_extract_layer(
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
+    diff_id: &str,
     per_layer: &indicatif::ProgressBar,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<()> {
-    let digest = layer_desc.digest.clone();
+    let diff_id = diff_id.to_string();
     let reference = reference.clone();
     let layer_desc = layer_desc.clone();
     let per_layer = per_layer.clone();
@@ -1043,7 +1059,7 @@ async fn fetch_and_extract_layer(
     // pull the blob async → write to .download.tmp → spawn blocking
     // extraction.
     let layers_root = cache::layers_root()?;
-    let key = cache::layer_key(&digest);
+    let key = cache::layer_key(&diff_id);
     let download = layers_root.join(format!("{key}.download"));
     let download_tmp = layers_root.join(format!("{key}.download.tmp"));
 
@@ -1070,7 +1086,7 @@ async fn fetch_and_extract_layer(
 
     tokio::task::spawn_blocking(move || {
         layer::ensure_layer_cached(
-            &digest,
+            &diff_id,
             |_tmp| {
                 // .download already exists from the async pull above, so the
                 // fetch closure is not called. If somehow it is, fail loudly.
@@ -1610,7 +1626,7 @@ mod tests {
         let path = cache::image_path("sha256:legacy").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let legacy = serde_json::json!({
-            "schema": "v2",
+            "schema": "v3",
             "image_id": "sha256:legacy",
             "name": "node:22",
             "image_layers": [cache::layer_key("sha256:L1")],
