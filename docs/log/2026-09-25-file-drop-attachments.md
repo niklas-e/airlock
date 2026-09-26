@@ -13,9 +13,9 @@ itself.
 
 The stdin filter handles raw, monitor, and exec sessions. It buffers complete
 bracketed pastes up to 64 KiB and parses lists of up to 16 absolute paths.
-Other input passes through unchanged. Partial markers and incomplete pastes
-time out. The timeout keeps the source read pending, because cancelling it
-could lose input that the source already consumed.
+Other input passes through unchanged. Incomplete pastes time out. The
+timeout keeps the source read pending, because cancelling it could lose input
+that the source already consumed.
 
 Each sandbox has a private directory under `~/.cache/airlock/imports`.
 Copies are staged outside the exported subtree, then a rename publishes the
@@ -80,12 +80,21 @@ them exactly, so the reservation is also the final use. A failed copy
 releases the reservation. A copy that ends after shutdown finds the store
 closed and publishes nothing.
 
+## Esc without delay
+
+The first decoder held back bytes that could start a paste marker, so a lone
+Esc waited up to 50 ms for the rest of a split marker. The filter never
+changes marker bytes, so the decoder now forwards them at once and only counts
+how much of the marker it has seen. Only the paste body waits for the end
+marker. The guest receives the same bytes as before. The idle timeout still
+ends an unfinished paste and resets marker and string state, but it no longer
+holds back input.
+
 ## Known limitations
 
 Terminals send drops and pastes the same way. A pasted absolute host path
 therefore imports that file, and a path that exists both in the guest and on
-the host changes to the path of the host copy. A lone Esc key waits up to
-50 ms before it reaches the guest, because it can start a paste marker.
+the host changes to the path of the host copy.
 
 File managers copy unquoted paths, one per line, and terminals send the line
 breaks of a paste as CR. The parser therefore falls back to one literal path

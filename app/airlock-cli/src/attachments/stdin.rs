@@ -10,7 +10,7 @@ use futures::future::LocalBoxFuture;
 use tokio::sync::Mutex;
 
 use super::Imports;
-use super::paste::{Decoder, END, Part, START};
+use super::paste::{Decoder, END, Part};
 
 enum Input {
     Data(Vec<u8>),
@@ -102,8 +102,9 @@ impl stdin::Server for Filter {
                         let data = match part {
                             Part::Bytes(bytes) => bytes,
                             Part::Paste(bytes) => {
-                                let rewritten = self.imports.rewrite(bytes).await;
-                                [START, rewritten.as_slice(), END].concat()
+                                let mut rewritten = self.imports.rewrite(bytes).await;
+                                rewritten.extend_from_slice(END);
+                                rewritten
                             }
                         };
                         state.ready.push_back(Input::Data(data));
@@ -138,6 +139,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::attachments::paste::START;
     use crate::attachments::tests::{fixture, imported_path, put};
 
     fn channel(
@@ -154,6 +156,15 @@ mod tests {
             Input::Data(bytes) => bytes,
             _ => panic!("expected data"),
         }
+    }
+
+    /// Marker bytes arrive before the paste body, so a paste spans several reads.
+    async fn data_until(client: &stdin::Client, end: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(end) {
+            bytes.extend(data(client).await);
+        }
+        bytes
     }
 
     #[tokio::test]
@@ -176,7 +187,7 @@ mod tests {
                     .await
                     .unwrap();
                 drop(tx);
-                let output = data(&client).await;
+                let output = data_until(&client, END).await;
                 let guest = std::str::from_utf8(
                     output
                         .strip_prefix(START)
@@ -195,6 +206,25 @@ mod tests {
                     Input::Resize(40, 100)
                 ));
                 assert!(matches!(read_source(client).await.unwrap(), Input::Eof));
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_escape_is_forwarded_without_delay() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_dir, imports) = fixture();
+                let (tx, client) = channel(&imports, true);
+                for key in [b"\x1b".as_slice(), b"\x1b[", b"\x1b[20"] {
+                    tx.send(airlock_monitor::TuiInputEvent::Data(key.to_vec()))
+                        .await
+                        .unwrap();
+                    let start = tokio::time::Instant::now();
+                    assert_eq!(data(&client).await, key);
+                    // The paused clock only advances while a timer waits.
+                    assert_eq!(start.elapsed(), Duration::ZERO, "{key:?}");
+                }
             })
             .await;
     }
@@ -259,7 +289,7 @@ mod tests {
                     .await
                     .unwrap();
                 drop(tx);
-                assert_eq!(data(&client).await, input);
+                assert_eq!(data_until(&client, path.as_bytes()).await, input);
                 assert!(matches!(read_source(client).await.unwrap(), Input::Eof));
                 assert_eq!(imports.0.lock().files, 0);
             })

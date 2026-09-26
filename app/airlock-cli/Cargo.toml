@@ -76,6 +76,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 axum = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

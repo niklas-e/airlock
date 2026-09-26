@@ -38,18 +38,32 @@ impl Control {
     }
 }
 
+/// Splits input into pass-through bytes and paste bodies. Marker bytes pass
+/// through at once, because the filter never changes them. Only a paste body
+/// waits for its end marker.
 #[derive(Default)]
 pub struct Decoder {
-    prefix: Vec<u8>,
+    /// Matched length of the current marker: END in a paste or bypass, else START.
+    seen: usize,
     paste: Option<Vec<u8>>,
     bypass: bool,
     control: Control,
 }
 
+/// Marker progress after `byte`. Neither marker repeats its first byte, so a
+/// mismatch can only restart the match at that byte.
+fn advance(marker: &[u8], seen: usize, byte: u8) -> usize {
+    if byte == marker[seen] {
+        seen + 1
+    } else {
+        usize::from(byte == marker[0])
+    }
+}
+
 impl Decoder {
-    /// An unterminated control string also counts, so that a timeout resets it.
+    /// Partial state that the idle timeout must end.
     pub fn is_pending(&self) -> bool {
-        !self.prefix.is_empty() || self.paste.is_some() || self.control != Control::Ground
+        self.seen > 0 || self.paste.is_some() || self.control != Control::Ground
     }
 
     pub fn in_paste(&self) -> bool {
@@ -60,46 +74,41 @@ impl Decoder {
         let mut out = Vec::new();
         let mut raw = Vec::new();
         for &byte in bytes {
-            if matches!(self.control, Control::String | Control::StringEscape) {
-                raw.push(byte);
-                self.control = self.control.next(byte);
-                continue;
-            }
-            self.prefix.push(byte);
-            let marker = if self.paste.is_some() || self.bypass {
-                END
-            } else {
-                START
-            };
-            while !marker.starts_with(&self.prefix) {
-                let byte = self.prefix.remove(0);
-                if let Some(paste) = &mut self.paste {
-                    paste.push(byte);
-                    if paste.len() > MAX_PASTE {
-                        raw.extend_from_slice(START);
-                        raw.extend(self.paste.take().expect("paste exists"));
-                        self.bypass = true;
-                    }
-                } else {
-                    raw.push(byte);
-                    if !self.bypass {
-                        self.control = self.control.next(byte);
-                    }
-                }
-            }
-            if self.prefix == marker {
-                self.prefix.clear();
-                if self.bypass {
-                    raw.extend_from_slice(END);
-                    self.bypass = false;
-                } else if let Some(paste) = self.paste.take() {
+            if let Some(paste) = &mut self.paste {
+                paste.push(byte);
+                self.seen = advance(END, self.seen, byte);
+                if self.seen == END.len() {
+                    self.seen = 0;
+                    let mut paste = self.paste.take().expect("paste exists");
+                    paste.truncate(paste.len() - END.len());
                     if !raw.is_empty() {
                         out.push(Part::Bytes(std::mem::take(&mut raw)));
                     }
                     out.push(Part::Paste(paste));
-                } else {
-                    self.paste = Some(Vec::new());
+                } else if paste.len() - self.seen > MAX_PASTE {
+                    raw.extend(self.paste.take().expect("paste exists"));
+                    self.bypass = true;
                 }
+                continue;
+            }
+            raw.push(byte);
+            if self.bypass {
+                self.seen = advance(END, self.seen, byte);
+                if self.seen == END.len() {
+                    self.seen = 0;
+                    self.bypass = false;
+                }
+                continue;
+            }
+            if matches!(self.control, Control::String | Control::StringEscape) {
+                self.control = self.control.next(byte);
+                continue;
+            }
+            self.control = self.control.next(byte);
+            self.seen = advance(START, self.seen, byte);
+            if self.seen == START.len() {
+                self.seen = 0;
+                self.paste = Some(Vec::new());
             }
         }
         if !raw.is_empty() {
@@ -111,14 +120,14 @@ impl Decoder {
     /// Bypass the rest of an interrupted paste so its tail cannot trigger imports.
     pub fn flush(&mut self) -> Vec<u8> {
         self.control = Control::Ground;
-        let mut bytes = Vec::new();
         if let Some(paste) = self.paste.take() {
-            bytes.extend_from_slice(START);
-            bytes.extend(paste);
             self.bypass = true;
+            return paste;
         }
-        bytes.append(&mut self.prefix);
-        bytes
+        if !self.bypass {
+            self.seen = 0;
+        }
+        Vec::new()
     }
 }
 
@@ -202,13 +211,36 @@ mod tests {
             match part {
                 Part::Bytes(bytes) => out.extend(bytes),
                 Part::Paste(bytes) => {
-                    out.extend_from_slice(START);
                     out.extend(bytes);
                     out.extend_from_slice(END);
                 }
             }
         }
         out
+    }
+
+    fn pastes(parts: Vec<Part>) -> Vec<Vec<u8>> {
+        parts
+            .into_iter()
+            .filter_map(|part| match part {
+                Part::Paste(bytes) => Some(bytes),
+                Part::Bytes(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marker_bytes_pass_through_without_waiting() {
+        let mut decoder = Decoder::default();
+        for byte in START.iter().chain(b"/a") {
+            let parts = decoder.feed(&[*byte]);
+            if b"/a".contains(byte) {
+                assert!(parts.is_empty());
+            } else {
+                assert_eq!(parts, [Part::Bytes(vec![*byte])]);
+            }
+        }
+        assert_eq!(pastes(decoder.feed(END)), [b"/a".to_vec()]);
     }
 
     #[test]
@@ -229,10 +261,7 @@ mod tests {
         let input = b"\x1b[200~/a\x1b[201~\x1b[200~/b\x1b[201~";
         let mut decoder = Decoder::default();
         let parts: Vec<_> = input.iter().flat_map(|b| decoder.feed(&[*b])).collect();
-        assert_eq!(
-            parts,
-            [Part::Paste(b"/a".to_vec()), Part::Paste(b"/b".to_vec())]
-        );
+        assert_eq!(pastes(parts), [b"/a".to_vec(), b"/b".to_vec()]);
     }
 
     #[test]
@@ -295,8 +324,8 @@ mod tests {
             assert_eq!(decoder.feed(input), [Part::Bytes(input.to_vec())]);
             assert!(!decoder.is_pending());
             assert_eq!(
-                decoder.feed(b"\x1b[200~/a\x1b[201~"),
-                [Part::Paste(b"/a".to_vec())]
+                pastes(decoder.feed(b"\x1b[200~/a\x1b[201~")),
+                [b"/a".to_vec()]
             );
         }
     }
@@ -308,8 +337,8 @@ mod tests {
         assert!(decoder.is_pending());
         assert!(decoder.flush().is_empty());
         assert_eq!(
-            decoder.feed(b"\x1b[200~/a\x1b[201~"),
-            [Part::Paste(b"/a".to_vec())]
+            pastes(decoder.feed(b"\x1b[200~/a\x1b[201~")),
+            [b"/a".to_vec()]
         );
     }
 
