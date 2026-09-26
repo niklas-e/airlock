@@ -143,7 +143,7 @@ impl Imports {
             return bytes;
         };
         let imports = self.clone();
-        match tokio::task::spawn_blocking(move || imports.0.lock().import(&paths)).await {
+        match tokio::task::spawn_blocking(move || imports.import(&paths)).await {
             Ok(Ok(rewritten)) => rewritten.into_bytes(),
             Ok(Err(err)) => {
                 tracing::warn!("file attachment not imported; forwarding original paste: {err:#}");
@@ -220,13 +220,102 @@ fn clean_bucket(parent: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct Source {
+    index: usize,
+    file: File,
+    metadata: std::fs::Metadata,
+    name: String,
+}
+
+impl Imports {
+    fn import(&self, paths: &[String]) -> anyhow::Result<String> {
+        let (mut outputs, copies, batch) = {
+            let mut store = self.0.lock();
+            let (outputs, copies) = store.resolve(paths)?;
+            if copies.is_empty() {
+                return Ok(join(outputs));
+            }
+            let bytes = copies.iter().map(|c| c.metadata.len()).sum::<u64>();
+            if store.files + copies.len() > store.limits.files {
+                bail!("attachment file-count limit reached");
+            }
+            if store.bytes + bytes > store.limits.total_size.0 {
+                bail!("attachment size limit reached");
+            }
+            let session = store.session.as_ref().context(CLOSED)?;
+            // Keep incomplete batches outside the share until the final rename.
+            let batch = tempfile::Builder::new()
+                .prefix("batch-")
+                .tempdir_in(session.path())?;
+            store.files += copies.len();
+            store.bytes += bytes;
+            (outputs, copies, batch)
+        };
+        // Copy without the lock, so other sessions and shutdown do not wait.
+        let count = copies.len();
+        let bytes = copies.iter().map(|c| c.metadata.len()).sum::<u64>();
+        let id = hex::encode(rand::random::<[u8; 16]>());
+        let published = copy_batch(copies, batch.path(), &id, &mut outputs).and_then(|()| {
+            let store = self.0.lock();
+            store.session.as_ref().context(CLOSED)?;
+            std::fs::rename(batch.path(), store.share.join(&id))?;
+            Ok(())
+        });
+        if let Err(err) = published {
+            let mut store = self.0.lock();
+            store.files -= count;
+            store.bytes -= bytes;
+            return Err(err);
+        }
+        Ok(join(outputs))
+    }
+}
+
+const CLOSED: &str = "sandbox attachment storage is closed";
+
+fn join(outputs: Vec<Option<String>>) -> String {
+    outputs.into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+fn copy_batch(
+    copies: Vec<Source>,
+    batch: &Path,
+    id: &str,
+    outputs: &mut [Option<String>],
+) -> anyhow::Result<()> {
+    for Source {
+        index,
+        mut file,
+        metadata: before,
+        name,
+    } in copies
+    {
+        let name = format!("{index}-{name}");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(batch.join(&name))?;
+        let copied = std::io::copy(&mut (&mut file).take(before.len() + 1), &mut output)?;
+        let after = file.metadata()?;
+        if copied != before.len()
+            || after.len() != before.len()
+            || after.modified()? != before.modified()?
+        {
+            bail!("dropped file changed while copying; drop it again");
+        }
+        output.flush()?;
+        output.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+        outputs[index] = Some(format!("{GUEST_ROOT}/{id}/{name}"));
+    }
+    std::fs::set_permissions(batch, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
 impl Store {
-    fn import(&mut self, paths: &[String]) -> anyhow::Result<String> {
-        let session = self
-            .session
-            .as_ref()
-            .context("sandbox attachment storage is closed")?;
-        let mut sources = Vec::new();
+    fn resolve(&self, paths: &[String]) -> anyhow::Result<(Vec<Option<String>>, Vec<Source>)> {
+        self.session.as_ref().context(CLOSED)?;
+        let mut copies = Vec::new();
         let mut outputs = Vec::new();
         for text in paths {
             let path = Path::new(text);
@@ -276,7 +365,6 @@ impl Store {
             });
             if let Some(mapped) = mapped {
                 outputs.push(Some(quote_path(&mapped.to_string_lossy())));
-                sources.push(None);
             } else {
                 // Secrets such as ~/.ssh keys and airlock state live in hidden paths.
                 if path
@@ -291,57 +379,16 @@ impl Store {
                         self.limits.file_size
                     );
                 }
+                copies.push(Source {
+                    index: outputs.len(),
+                    file,
+                    metadata,
+                    name: safe_name(path),
+                });
                 outputs.push(None);
-                sources.push(Some((file, metadata, safe_name(path))));
             }
         }
-        let count = sources.iter().filter(|f| f.is_some()).count();
-        if self.files + count > self.limits.files {
-            bail!("attachment file-count limit reached");
-        }
-        if count == 0 {
-            return Ok(outputs.into_iter().flatten().collect::<Vec<_>>().join(" "));
-        }
-
-        // Keep incomplete batches outside the share until the final rename.
-        let batch = tempfile::Builder::new()
-            .prefix("batch-")
-            .tempdir_in(session.path())?;
-        let id = hex::encode(rand::random::<[u8; 16]>());
-        let mut total = 0;
-        for (index, source) in sources.into_iter().enumerate() {
-            let Some((mut input, before, name)) = source else {
-                continue;
-            };
-            let name = format!("{index}-{name}");
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(batch.path().join(&name))?;
-            let allowance = (self.limits.file_size.0)
-                .min(self.limits.total_size.0.saturating_sub(self.bytes + total));
-            let copied = std::io::copy(&mut (&mut input).take(allowance + 1), &mut output)?;
-            if copied > allowance {
-                bail!("attachment size limit reached");
-            }
-            let after = input.metadata()?;
-            if copied != before.len()
-                || after.len() != before.len()
-                || after.modified()? != before.modified()?
-            {
-                bail!("dropped file changed while copying; drop it again");
-            }
-            output.flush()?;
-            output.set_permissions(std::fs::Permissions::from_mode(0o444))?;
-            total += copied;
-            outputs[index] = Some(format!("{GUEST_ROOT}/{id}/{name}"));
-        }
-        std::fs::set_permissions(batch.path(), std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(batch.path(), self.share.join(&id))?;
-        self.bytes += total;
-        self.files += count;
-        Ok(outputs.into_iter().flatten().collect::<Vec<_>>().join(" "))
+        Ok((outputs, copies))
     }
 }
 

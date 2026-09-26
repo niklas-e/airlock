@@ -40,11 +40,7 @@ pub(super) fn imported_path(imports: &Imports, guest: &str) -> PathBuf {
 fn copies_are_independent_readable_and_cleaned_up() {
     let (dir, imports) = fixture();
     let source = put(dir.path(), "Screenshot 猫 2026.png", b"image contents");
-    let guest = imports
-        .0
-        .lock()
-        .import(std::slice::from_ref(&source))
-        .unwrap();
+    let guest = imports.import(std::slice::from_ref(&source)).unwrap();
     let copy = imported_path(&imports, &guest);
     assert_eq!(Path::new(&guest).extension().unwrap(), "png");
     assert!(!guest.contains(' '));
@@ -62,7 +58,7 @@ fn copies_are_independent_readable_and_cleaned_up() {
     let clone = imports.clone();
     imports.close();
     assert!(!copy.exists());
-    assert!(clone.0.lock().import(&[source]).is_err());
+    assert!(clone.import(&[source]).is_err());
 }
 
 #[test]
@@ -85,8 +81,6 @@ fn refuses_symlinks_including_ancestor_redirection_and_special_files() {
     ] {
         assert!(
             imports
-                .0
-                .lock()
                 .import(&[path.to_string_lossy().into_owned()])
                 .is_err(),
             "{}",
@@ -110,16 +104,20 @@ fn failed_batches_publish_nothing_and_do_not_consume_quota() {
         .unwrap()
         .set_len((1 << 20) + 1)
         .unwrap();
-    let mut store = imports.0.lock();
-    let err = store.import(&[first.clone(), large]).unwrap_err();
+    let err = imports.import(&[first.clone(), large]).unwrap_err();
     assert!(err.to_string().contains("1 MiB"), "{err:#}");
-    assert_eq!(store.bytes, 0);
-    assert_eq!(std::fs::read_dir(&store.share).unwrap().count(), 0);
-    // Force failure during the copy phase, after staging the first file.
-    store.limits.total_size = ByteSize(5);
+    imports.0.lock().limits.total_size = ByteSize(8);
     let second = put(dir.path(), "second.png", b"too big");
-    assert!(store.import(&[first, second]).is_err());
-    assert_eq!(store.bytes, 0);
+    assert!(imports.import(&[first.clone(), second]).is_err());
+    // procfs reports size 0 but has content, which fails the copy phase.
+    #[cfg(target_os = "linux")]
+    {
+        let status = format!("/proc/{}/status", std::process::id());
+        let err = imports.import(&[first, status]).unwrap_err();
+        assert!(err.to_string().contains("changed while copying"), "{err:#}");
+    }
+    let store = imports.0.lock();
+    assert_eq!((store.bytes, store.files), (0, 0));
     assert_eq!(std::fs::read_dir(&store.share).unwrap().count(), 0);
     assert_eq!(
         std::fs::read_dir(store.session.as_ref().unwrap().path())
@@ -133,25 +131,29 @@ fn failed_batches_publish_nothing_and_do_not_consume_quota() {
 fn maps_shared_paths_but_respects_masks_and_overlapping_mounts() {
     let (dir, imports) = fixture();
     let source = put(dir.path(), "image.png", b"image");
-    let mut store = imports.0.lock();
-    store.rules.mappings.push(Mapping {
+    imports.0.lock().rules.mappings.push(Mapping {
         source: dir.path().to_owned(),
         target: "/workspace".into(),
         dir: true,
     });
     assert_eq!(
-        store.import(std::slice::from_ref(&source)).unwrap(),
+        imports.import(std::slice::from_ref(&source)).unwrap(),
         "/workspace/image.png"
     );
-    assert_eq!(store.files, 0);
-    store.rules.blocked.push(PathBuf::from(&source));
-    assert!(store.import(std::slice::from_ref(&source)).is_err());
-    store.rules.blocked.clear();
-    store.rules.hidden.push("/workspace/image.png".into());
-    assert!(store.import(std::slice::from_ref(&source)).is_err());
-    store.rules.hidden.clear();
-    store.rules.shadowed.push("/workspace".into());
-    assert!(store.import(&[source]).unwrap().starts_with(GUEST_ROOT));
+    assert_eq!(imports.0.lock().files, 0);
+    imports.0.lock().rules.blocked.push(PathBuf::from(&source));
+    assert!(imports.import(std::slice::from_ref(&source)).is_err());
+    imports.0.lock().rules.blocked.clear();
+    imports
+        .0
+        .lock()
+        .rules
+        .hidden
+        .push("/workspace/image.png".into());
+    assert!(imports.import(std::slice::from_ref(&source)).is_err());
+    imports.0.lock().rules.hidden.clear();
+    imports.0.lock().rules.shadowed.push("/workspace".into());
+    assert!(imports.import(&[source]).unwrap().starts_with(GUEST_ROOT));
 }
 
 #[test]
@@ -160,22 +162,24 @@ fn nested_mounts_map_to_the_most_specific_target() {
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     let outer = put(dir.path(), "outer.png", b"outer");
     let inner = put(&dir.path().join("sub"), "inner.png", b"inner");
-    let mut store = imports.0.lock();
     for (source, target) in [
         (dir.path().to_owned(), "/workspace"),
         (dir.path().join("sub"), "/workspace/sub"),
     ] {
-        store.rules.mappings.push(Mapping {
+        imports.0.lock().rules.mappings.push(Mapping {
             source,
             target: target.into(),
             dir: true,
         });
     }
-    assert_eq!(store.import(&[outer]).unwrap(), "/workspace/outer.png");
-    assert_eq!(store.import(&[inner]).unwrap(), "/workspace/sub/inner.png");
-    store.rules.mappings[1].source = dir.path().join("elsewhere");
+    assert_eq!(imports.import(&[outer]).unwrap(), "/workspace/outer.png");
+    assert_eq!(
+        imports.import(&[inner]).unwrap(),
+        "/workspace/sub/inner.png"
+    );
+    imports.0.lock().rules.mappings[1].source = dir.path().join("elsewhere");
     let shadowed = put(&dir.path().join("sub"), "shadowed.png", b"shadowed");
-    assert!(store.import(&[shadowed]).unwrap().starts_with(GUEST_ROOT));
+    assert!(imports.import(&[shadowed]).unwrap().starts_with(GUEST_ROOT));
 }
 
 #[test]
@@ -184,32 +188,30 @@ fn hidden_paths_are_mapped_but_never_copied() {
     std::fs::create_dir(dir.path().join(".ssh")).unwrap();
     let key = put(&dir.path().join(".ssh"), "id_ed25519", b"secret");
     let dotfile = put(dir.path(), ".env", b"secret");
-    let mut store = imports.0.lock();
     for path in [&key, &dotfile] {
-        assert!(store.import(std::slice::from_ref(path)).is_err(), "{path}");
+        assert!(
+            imports.import(std::slice::from_ref(path)).is_err(),
+            "{path}"
+        );
     }
-    assert_eq!(store.files, 0);
-    store.rules.mappings.push(Mapping {
+    assert_eq!(imports.0.lock().files, 0);
+    imports.0.lock().rules.mappings.push(Mapping {
         source: dir.path().to_owned(),
         target: "/workspace".into(),
         dir: true,
     });
-    assert_eq!(store.import(&[dotfile]).unwrap(), "/workspace/.env");
+    assert_eq!(imports.import(&[dotfile]).unwrap(), "/workspace/.env");
 }
 
 #[test]
 fn duplicate_names_and_repeated_drops_never_overwrite() {
     let (dir, imports) = fixture();
     let source = put(dir.path(), "image.png", b"first");
-    let a = imports
-        .0
-        .lock()
-        .import(&[source.clone(), source.clone()])
-        .unwrap();
+    let a = imports.import(&[source.clone(), source.clone()]).unwrap();
     let paths: Vec<_> = a.split(' ').collect();
     assert_ne!(paths[0], paths[1]);
     std::fs::write(&source, b"second").unwrap();
-    let b = imports.0.lock().import(&[source]).unwrap();
+    let b = imports.import(&[source]).unwrap();
     assert_ne!(paths[0], b);
     assert_eq!(
         std::fs::read(imported_path(&imports, paths[0])).unwrap(),
@@ -251,11 +253,10 @@ async fn concurrent_sessions_share_the_file_count_limit() {
 fn parent_traversal_cannot_bypass_mask_checks() {
     let (dir, imports) = fixture();
     let secret = put(dir.path(), "secret.png", b"secret");
-    let mut store = imports.0.lock();
-    store.rules.blocked.push(secret.into());
+    imports.0.lock().rules.blocked.push(secret.into());
     let traversal = format!("{}/child/../secret.png", dir.path().display());
-    assert!(store.import(&[traversal]).is_err());
-    assert_eq!(store.files, 0);
+    assert!(imports.import(&[traversal]).is_err());
+    assert_eq!(imports.0.lock().files, 0);
 }
 
 #[test]
@@ -298,10 +299,14 @@ fn masks_match_by_identity_not_by_spelling() {
     std::fs::create_dir(dir.path().join("masked")).unwrap();
     let secret = put(&dir.path().join("masked"), "secret.png", b"secret");
     symlink(dir.path().join("masked"), dir.path().join("alias")).unwrap();
-    let mut store = imports.0.lock();
-    store.rules.blocked.push(dir.path().join("alias"));
-    assert!(store.import(&[secret]).is_err());
-    assert_eq!(store.files, 0);
+    imports
+        .0
+        .lock()
+        .rules
+        .blocked
+        .push(dir.path().join("alias"));
+    assert!(imports.import(&[secret]).is_err());
+    assert_eq!(imports.0.lock().files, 0);
 }
 
 #[test]

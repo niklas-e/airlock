@@ -70,6 +70,16 @@ decoder therefore tracks OSC, DCS, APC, PM, and SOS strings and ignores paste
 markers inside them. A string ends at BEL, ST, CAN, or SUB. A key such as
 Alt+] also starts a string, so the idle timeout ends an unterminated string.
 
+## Locking
+
+The store lock covers path checks, quota reservation, and the final rename,
+but not the copy. A copy can take up to 256 MiB of I/O, and shutdown closes
+the store from the async runtime, so it must not wait for a copy. The
+reservation uses the file sizes from before the copy. The copy must match
+them exactly, so the reservation is also the final use. A failed copy
+releases the reservation. A copy that ends after shutdown finds the store
+closed and publishes nothing.
+
 ## Known limitations
 
 Terminals send drops and pastes the same way. A pasted absolute host path
