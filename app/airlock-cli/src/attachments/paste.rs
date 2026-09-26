@@ -1,0 +1,308 @@
+//! Bracketed-paste framing and terminal path parsing.
+
+pub const START: &[u8] = b"\x1b[200~";
+pub const END: &[u8] = b"\x1b[201~";
+pub const MAX_PASTE: usize = 64 * 1024;
+const MAX_PATHS: usize = 16;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Part {
+    Bytes(Vec<u8>),
+    Paste(Vec<u8>),
+}
+
+#[derive(Default)]
+pub struct Decoder {
+    prefix: Vec<u8>,
+    paste: Option<Vec<u8>>,
+    bypass: bool,
+}
+
+impl Decoder {
+    pub fn is_pending(&self) -> bool {
+        !self.prefix.is_empty() || self.paste.is_some()
+    }
+
+    pub fn in_paste(&self) -> bool {
+        self.paste.is_some()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Part> {
+        let mut out = Vec::new();
+        let mut raw = Vec::new();
+        for &byte in bytes {
+            self.prefix.push(byte);
+            let marker = if self.paste.is_some() || self.bypass {
+                END
+            } else {
+                START
+            };
+            while !marker.starts_with(&self.prefix) {
+                let byte = self.prefix.remove(0);
+                if let Some(paste) = &mut self.paste {
+                    paste.push(byte);
+                    if paste.len() > MAX_PASTE {
+                        raw.extend_from_slice(START);
+                        raw.extend(self.paste.take().expect("paste exists"));
+                        self.bypass = true;
+                    }
+                } else {
+                    raw.push(byte);
+                }
+            }
+            if self.prefix == marker {
+                self.prefix.clear();
+                if self.bypass {
+                    raw.extend_from_slice(END);
+                    self.bypass = false;
+                } else if let Some(paste) = self.paste.take() {
+                    if !raw.is_empty() {
+                        out.push(Part::Bytes(std::mem::take(&mut raw)));
+                    }
+                    out.push(Part::Paste(paste));
+                } else {
+                    self.paste = Some(Vec::new());
+                }
+            }
+        }
+        if !raw.is_empty() {
+            out.push(Part::Bytes(raw));
+        }
+        out
+    }
+
+    /// Bypass the rest of an interrupted paste so its tail cannot trigger imports.
+    pub fn flush(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Some(paste) = self.paste.take() {
+            bytes.extend_from_slice(START);
+            bytes.extend(paste);
+            self.bypass = true;
+        }
+        bytes.append(&mut self.prefix);
+        bytes
+    }
+}
+
+/// Parse a paste as absolute paths. Terminals quote dropped paths for the
+/// shell, but file managers copy unquoted paths, one per line.
+pub fn paths(text: &[u8]) -> Option<Vec<String>> {
+    shell_words(text).or_else(|| literal_lines(text))
+}
+
+/// Parse shell-quoted absolute paths without expanding variables or substitutions.
+fn shell_words(text: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(text).ok()?;
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            if quote == Some('"') && !matches!(c, '$' | '`' | '"' | '\\') {
+                word.push('\\');
+            }
+            word.push(c);
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(c) {
+            quote = None;
+        } else if quote.is_some() {
+            word.push(c);
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c == ' ' {
+            if !word.is_empty() {
+                paths.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    if !word.is_empty() {
+        paths.push(word);
+    }
+    if paths.is_empty() || paths.len() > MAX_PATHS || paths.iter().any(|p| !p.starts_with('/')) {
+        return None;
+    }
+    Some(paths)
+}
+
+/// Terminals send the line breaks of a paste as CR, so every line ending counts.
+fn literal_lines(text: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(text).ok()?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    let paths: Vec<String> = text
+        .split("\r\n")
+        .flat_map(|line| line.split(['\r', '\n']))
+        .map(str::to_owned)
+        .collect();
+    if paths.len() > MAX_PATHS
+        || paths
+            .iter()
+            .any(|p| !p.starts_with('/') || p.chars().any(char::is_control))
+    {
+        return None;
+    }
+    Some(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(parts: Vec<Part>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                Part::Bytes(bytes) => out.extend(bytes),
+                Part::Paste(bytes) => {
+                    out.extend_from_slice(START);
+                    out.extend(bytes);
+                    out.extend_from_slice(END);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_chunk_boundary_preserves_input_and_detects_paste() {
+        let input = b"before\x1b[200~/tmp/a.png\x1b[201~\rafter";
+        for split in 0..=input.len() {
+            let mut decoder = Decoder::default();
+            let mut parts = decoder.feed(&input[..split]);
+            parts.extend(decoder.feed(&input[split..]));
+            assert!(parts.contains(&Part::Paste(b"/tmp/a.png".to_vec())));
+            assert_eq!(encode(parts), input);
+            assert!(decoder.flush().is_empty());
+        }
+    }
+
+    #[test]
+    fn byte_at_a_time_and_consecutive_pastes() {
+        let input = b"\x1b[200~/a\x1b[201~\x1b[200~/b\x1b[201~";
+        let mut decoder = Decoder::default();
+        let parts: Vec<_> = input.iter().flat_map(|b| decoder.feed(&[*b])).collect();
+        assert_eq!(
+            parts,
+            [Part::Paste(b"/a".to_vec()), Part::Paste(b"/b".to_vec())]
+        );
+    }
+
+    #[test]
+    fn incomplete_and_oversized_pastes_are_lossless() {
+        for input in [
+            b"\x1b".to_vec(),
+            b"a\x1b[200~/a\x1b[20".to_vec(),
+            [START, &vec![b'x'; MAX_PASTE + 100], END, b"\r"].concat(),
+        ] {
+            let mut decoder = Decoder::default();
+            let mut out = encode(decoder.feed(&input));
+            out.extend(decoder.flush());
+            assert_eq!(out, input);
+        }
+    }
+
+    #[test]
+    fn timed_out_paste_tail_cannot_import() {
+        let mut decoder = Decoder::default();
+        decoder.feed(b"\x1b[200~unfinished");
+        decoder.flush();
+        let parts = decoder.feed(b"\x1b[200~/secret\x1b[201~");
+        assert!(parts.iter().all(|p| matches!(p, Part::Bytes(_))));
+    }
+
+    #[test]
+    fn arbitrary_bytes_and_chunk_sizes_are_lossless() {
+        let mut seed = 12345_u32;
+        for _ in 0..200 {
+            let mut input = Vec::new();
+            for _ in 0..100 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                match seed % 5 {
+                    0 => input.extend_from_slice(START),
+                    1 => input.extend_from_slice(END),
+                    _ => input.extend_from_slice(&seed.to_le_bytes()),
+                }
+            }
+            let mut decoder = Decoder::default();
+            let mut out = Vec::new();
+            for chunk in input.chunks((seed as usize % 17) + 1) {
+                out.extend(encode(decoder.feed(chunk)));
+            }
+            out.extend(decoder.flush());
+            assert_eq!(out, input);
+        }
+    }
+
+    #[test]
+    fn lexes_terminal_paths_without_evaluating_them() {
+        assert_eq!(
+            paths(r#"'/tmp/a b.png' /tmp/c\ d.png "/tmp/猫.png" "#.as_bytes()),
+            Some(vec![
+                "/tmp/a b.png".into(),
+                "/tmp/c d.png".into(),
+                "/tmp/猫.png".into()
+            ])
+        );
+        for input in [
+            "describe /tmp/a.png",
+            "relative.png",
+            "/a\n\n/b",
+            "/a\r relative",
+            "'/a",
+            "file:///a",
+            "",
+            "/a\0",
+        ] {
+            assert_eq!(paths(input.as_bytes()), None, "{input:?}");
+        }
+        assert_eq!(
+            paths(b"'/tmp/$(touch owned).png'"),
+            Some(vec!["/tmp/$(touch owned).png".into()])
+        );
+    }
+
+    #[test]
+    fn unquoted_file_manager_paths_are_read_line_by_line() {
+        assert_eq!(
+            paths(b"/home/me/Pictures/Screenshot 2026.png"),
+            Some(vec!["/home/me/Pictures/Screenshot 2026.png".into()])
+        );
+        for separator in ["\r", "\n", "\r\n"] {
+            let input = format!("/home/me/a b.png{separator}/home/me/it's.png{separator}");
+            assert_eq!(
+                paths(input.as_bytes()),
+                Some(vec!["/home/me/a b.png".into(), "/home/me/it's.png".into()]),
+                "{separator:?}"
+            );
+        }
+        // Taken literally, text after a path is part of a file name. The
+        // import then fails and forwards the paste unchanged.
+        assert_eq!(
+            paths(b"/home/me/a.png is broken"),
+            Some(vec!["/home/me/a.png is broken".into()])
+        );
+    }
+
+    #[test]
+    fn double_quotes_preserve_literal_backslashes() {
+        assert_eq!(
+            paths(br#""/tmp/a\b.png" "/tmp/a\\b.png" "/tmp/a\"b.png" "/tmp/\$file.png""#),
+            Some(vec![
+                r"/tmp/a\b.png".into(),
+                r"/tmp/a\b.png".into(),
+                "/tmp/a\"b.png".into(),
+                "/tmp/$file.png".into(),
+            ])
+        );
+    }
+}

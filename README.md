@@ -25,6 +25,7 @@ Docker required. Works on both macOS and Linux.
 - **Presets** — secure defaults for Claude Code, OpenAI Codex, and GitHub
   Copilot CLI out of the box (PRs welcome for more).
 - **File & directory mounts** — share project files with the agent and nothing more.
+- **File attachments** — drop images and files into sandbox terminals.
 - **Host port & socket forwarding** — reach the host's PostgreSQL, Redis, or Docker.
 - **Agent hook integration** — surface network denials back to the agent so it
   sees *why* a tool failed and can stop to ask instead of retrying blindly.
@@ -128,6 +129,11 @@ $ airlock start --monitor -- claude --dangerously-skip-permissions
 ```
 
 ![Monitor dashboard](docs/manual/src/usage/monitor.png)
+
+[File attachments](docs/manual/src/usage/file-attachments.md) work in regular
+terminal mode, `--monitor`, and `airlock exec`. Airlock copies external files
+into a read-only share, so agents such as Claude Code attach dropped images
+as usual.
 
 Interested? See the [user manual](https://milankinen.github.io/airlock)
 for the full details.

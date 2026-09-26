@@ -103,6 +103,15 @@ pub struct VmInstance {
     pub cwd: String,
     pub uid: u32,
     pub gid: u32,
+    pub imports: Option<crate::attachments::Imports>,
+}
+
+impl Drop for VmInstance {
+    fn drop(&mut self) {
+        if let Some(imports) = &self.imports {
+            imports.close();
+        }
+    }
 }
 
 impl VmInstance {
@@ -110,6 +119,9 @@ impl VmInstance {
     pub async fn shutdown(mut self) {
         if let Some(handle) = self.sync_handle.take() {
             handle.shutdown().await;
+        }
+        if let Some(imports) = self.imports.take() {
+            let _ = tokio::task::spawn_blocking(move || imports.close()).await;
         }
     }
 
@@ -148,18 +160,24 @@ pub async fn start(
     project: &Project,
     image: &OciImage,
     container_home: &str,
+    file_drop: Option<crate::settings::FileDropLimits>,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
     let overlay_dir = project.sandbox_dir.join("overlay");
 
-    let mounts = assemble_mounts(project, container_home)?;
-    let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
+    let mut mounts = assemble_mounts(project, container_home)?;
     let (disk_image, caches) = disk::prepare(
         &project.sandbox_dir,
         &project.config.disk,
         container_home,
         &project.host_cwd,
     )?;
+    let imports = file_drop.and_then(|limits| {
+        crate::attachments::Imports::prepare(project, &mut mounts, &caches, limits)
+            .inspect_err(|err| cli::log!("File drop unavailable: {err:#}"))
+            .ok()
+    });
+    let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
     let cmd = resolve_cmd(args, image);
     let env = resolve_env(image, &project.env);
     let cwd = project.guest_cwd.to_string_lossy().into_owned();
@@ -200,6 +218,7 @@ pub async fn start(
         cwd,
         uid: image.uid,
         gid: image.gid,
+        imports,
     };
     // Wait for the in-VM supervisor to start listening. Reuses the
     // same retry loop as every other vsock we open later.

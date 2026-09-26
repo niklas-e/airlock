@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
 use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
+use crate::settings::FileDropLimits;
 use crate::vault::Vault;
 use crate::{cli_server, config, daemon, masking, network, oci, project, rpc, runtime, vm};
 
@@ -123,6 +124,10 @@ pub async fn main(
 
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
+    let file_drop = settings
+        .terminal
+        .file_drop
+        .then(|| settings.terminal.file_drop_limits.clone());
     if args.monitor {
         let keys = match crate::settings::keys::into_bindings(&settings.monitor.keys) {
             Ok(b) => b,
@@ -144,6 +149,7 @@ pub async fn main(
             sandbox_cwd,
             vault,
             MonitorRuntime::new(monitor_settings),
+            file_drop,
         )
         .await
     } else {
@@ -154,6 +160,7 @@ pub async fn main(
             sandbox_cwd,
             vault,
             RawTerminalRuntime::new(),
+            file_drop,
         )
         .await
     }
@@ -166,6 +173,7 @@ async fn run(
     project_cwd: Option<String>,
     vault: Vault,
     mut runtime: impl Runtime,
+    file_drop: Option<FileDropLimits>,
 ) -> anyhow::Result<i32> {
     // `lock` also resolves `[env]` (host substitution + surrogates for
     // masked entries), so a missing variable fails before the image pull.
@@ -202,7 +210,7 @@ async fn run(
     .await?;
 
     cli::log!("Booting VM...");
-    let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
+    let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home, file_drop).await?;
     project.save_meta();
 
     // A Ctrl+C during boot (the vsock connect can retry for ~12s) sets the
@@ -224,6 +232,8 @@ async fn run(
     network::reverse_forward::serve(reverse_forwards, &supervisor.client());
 
     let (stdin_client, pty_size) = runtime.attach_stdin()?;
+    let stdin_client =
+        crate::attachments::wrap(stdin_client, vm.imports.as_ref(), pty_size.is_some());
     let signals = runtime.signals()?;
 
     // Launch the output sink (enters raw mode for the raw runtime, spawns the
@@ -287,7 +297,12 @@ async fn run(
     // having to re-resolve the project.
     let sock_path = crate::cache::cli_sock_path(&project.sandbox_dir)?;
     let base_env = vm.env.clone();
-    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone(), base_env));
+    tokio::task::spawn_local(cli_server::serve(
+        sock_path,
+        supervisor.clone(),
+        base_env,
+        vm.imports.clone(),
+    ));
 
     spawn_signal_forwarder(signals, proc.clone());
     let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;

@@ -1,6 +1,7 @@
 //! `airlock` — host-side CLI for the airlock VM sandbox.
 
 mod assets;
+mod attachments;
 mod cache;
 pub(crate) mod cli;
 mod cli_server;

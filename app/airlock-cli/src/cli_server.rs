@@ -29,7 +29,12 @@ impl Drop for SockGuard {
 /// resolved environment (image env + config env, with surrogates for masked
 /// entries) — `exec` clients send overrides which are merged onto this
 /// before each child is spawned.
-pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<String>) {
+pub async fn serve(
+    sock_path: PathBuf,
+    supervisor: Supervisor,
+    base_env: Vec<String>,
+    imports: Option<crate::attachments::Imports>,
+) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
         Ok(l) => l,
@@ -46,7 +51,7 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<Str
             Ok((stream, _)) => {
                 let sup = supervisor.clone();
                 let env = base_env.clone();
-                handle_connection(stream, sup, env);
+                handle_connection(stream, sup, env, imports.clone());
             }
             Err(e) => {
                 // A failed accept() (transient ECONNABORTED, or fd exhaustion
@@ -68,6 +73,7 @@ fn handle_connection(
     stream: tokio::net::UnixStream,
     supervisor: Supervisor,
     base_env: Rc<Vec<String>>,
+    imports: Option<crate::attachments::Imports>,
 ) {
     let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
     let network = capnp_rpc::twoparty::VatNetwork::new(
@@ -79,6 +85,7 @@ fn handle_connection(
     let service: cli_service::Client = capnp_rpc::new_client(CliServiceImpl {
         supervisor,
         base_env,
+        imports,
     });
     let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(service.client));
     tokio::task::spawn_local(rpc);
@@ -88,6 +95,7 @@ fn handle_connection(
 struct CliServiceImpl {
     supervisor: Supervisor,
     base_env: Rc<Vec<String>>,
+    imports: Option<crate::attachments::Imports>,
 }
 
 impl cli_service::Server for CliServiceImpl {
@@ -109,6 +117,8 @@ impl cli_service::Server for CliServiceImpl {
         // Bridge: unix-socket Stdin → vsock Stdin
         let unix_stdin = params.get_stdin()?;
         let vsock_stdin: stdin::Client = capnp_rpc::new_client(StdinBridge { inner: unix_stdin });
+        let vsock_stdin =
+            crate::attachments::wrap(vsock_stdin, self.imports.as_ref(), pty_size.is_some());
 
         let user_cmd = params.get_cmd()?.to_str()?.to_string();
         let user_args: Vec<String> = params

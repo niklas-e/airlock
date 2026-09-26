@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use keys::KeyList;
-use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
+use smart_config::{
+    ByteSize, ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json,
+};
 
 use crate::config::de::format_error;
 use crate::config::load_config::{EXTENSIONS, parse_file};
@@ -33,6 +35,33 @@ pub struct Settings {
     /// `airlock.toml`.
     #[config(nest)]
     pub monitor: MonitorSettings,
+    #[config(nest)]
+    pub terminal: TerminalSettings,
+}
+
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+pub struct TerminalSettings {
+    /// Import files dropped or pasted into an interactive terminal.
+    #[config(default_t = true)]
+    pub file_drop: bool,
+    /// Limits for files that file drops copy into the sandbox. Only user
+    /// settings can change them, so a project cannot raise them.
+    #[config(nest)]
+    pub file_drop_limits: FileDropLimits,
+}
+
+/// Settings under the `[terminal.file_drop_limits]` table.
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+pub struct FileDropLimits {
+    /// Largest file that a drop copies.
+    #[config(default_t = ByteSize(32 << 20))]
+    pub file_size: ByteSize,
+    /// Total size of copies per sandbox run, shared by all sessions.
+    #[config(default_t = ByteSize(256 << 20))]
+    pub total_size: ByteSize,
+    /// Number of copies per sandbox run, shared by all sessions.
+    #[config(default_t = 256)]
+    pub files: usize,
 }
 
 /// Settings under the `[vault]` table.
@@ -161,6 +190,32 @@ mod tests {
         let missing = base.join("nope");
         let s = Settings::load_from(&missing).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
+        assert!(s.terminal.file_drop);
+        let limits = s.terminal.file_drop_limits;
+        assert_eq!(limits.file_size, ByteSize(32 << 20));
+        assert_eq!(limits.total_size, ByteSize(256 << 20));
+        assert_eq!(limits.files, 256);
+    }
+
+    #[test]
+    fn file_drop_limits_accept_human_readable_sizes() {
+        let dir = fresh_dir();
+        std::fs::write(
+            dir.join("settings.toml"),
+            "[terminal.file_drop_limits]\nfile_size = \"100 MiB\"\ntotal_size = \"1 GiB\"\nfiles = 10\n",
+        )
+        .unwrap();
+        let limits = Settings::load_from(&dir).unwrap().terminal.file_drop_limits;
+        assert_eq!(limits.file_size, ByteSize(100 << 20));
+        assert_eq!(limits.total_size, ByteSize(1 << 30));
+        assert_eq!(limits.files, 10);
+    }
+
+    #[test]
+    fn file_drop_can_be_disabled_in_user_settings() {
+        let dir = fresh_dir();
+        std::fs::write(dir.join("settings.toml"), "[terminal]\nfile_drop = false\n").unwrap();
+        assert!(!Settings::load_from(&dir).unwrap().terminal.file_drop);
     }
 
     #[test]
