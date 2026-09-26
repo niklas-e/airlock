@@ -60,6 +60,16 @@ directory on the way. A mask or a writable mount source blocks the path when
 its identity is among them. The text comparison stays for masked paths that do
 not exist yet.
 
+## Terminal replies
+
+The guest writes to the terminal, and the terminal answers some queries on
+stdin. Some terminals echo guest-controlled text in these answers, for example
+in a window title report. Before file drops, such an echo only reached the
+guest itself. Now a paste marker inside it could import a host file. The
+decoder therefore tracks OSC, DCS, APC, PM, and SOS strings and ignores paste
+markers inside them. A string ends at BEL, ST, CAN, or SUB. A key such as
+Alt+] also starts a string, so the idle timeout ends an unterminated string.
+
 ## Known limitations
 
 Terminals send drops and pastes the same way. A pasted absolute host path

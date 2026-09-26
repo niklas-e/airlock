@@ -11,16 +11,45 @@ pub enum Part {
     Paste(Vec<u8>),
 }
 
+/// Position relative to terminal control strings (OSC, DCS, APC, PM, SOS).
+/// Terminal replies, such as a window title report, can echo guest-controlled
+/// text inside such a string. Paste markers there must not trigger imports.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Control {
+    #[default]
+    Ground,
+    Escape,
+    String,
+    StringEscape,
+}
+
+impl Control {
+    fn next(self, byte: u8) -> Self {
+        match (self, byte) {
+            // BEL and ST terminate a string. CAN and SUB abort it.
+            (Self::String | Self::StringEscape, 0x07 | 0x18 | 0x1a)
+            | (Self::StringEscape, b'\\') => Self::Ground,
+            (Self::String | Self::StringEscape, 0x1b) => Self::StringEscape,
+            (Self::String | Self::StringEscape, _)
+            | (Self::Escape, b']' | b'P' | b'_' | b'^' | b'X') => Self::String,
+            (_, 0x1b) => Self::Escape,
+            _ => Self::Ground,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
     prefix: Vec<u8>,
     paste: Option<Vec<u8>>,
     bypass: bool,
+    control: Control,
 }
 
 impl Decoder {
+    /// An unterminated control string also counts, so that a timeout resets it.
     pub fn is_pending(&self) -> bool {
-        !self.prefix.is_empty() || self.paste.is_some()
+        !self.prefix.is_empty() || self.paste.is_some() || self.control != Control::Ground
     }
 
     pub fn in_paste(&self) -> bool {
@@ -31,6 +60,11 @@ impl Decoder {
         let mut out = Vec::new();
         let mut raw = Vec::new();
         for &byte in bytes {
+            if matches!(self.control, Control::String | Control::StringEscape) {
+                raw.push(byte);
+                self.control = self.control.next(byte);
+                continue;
+            }
             self.prefix.push(byte);
             let marker = if self.paste.is_some() || self.bypass {
                 END
@@ -48,6 +82,9 @@ impl Decoder {
                     }
                 } else {
                     raw.push(byte);
+                    if !self.bypass {
+                        self.control = self.control.next(byte);
+                    }
                 }
             }
             if self.prefix == marker {
@@ -73,6 +110,7 @@ impl Decoder {
 
     /// Bypass the rest of an interrupted paste so its tail cannot trigger imports.
     pub fn flush(&mut self) -> Vec<u8> {
+        self.control = Control::Ground;
         let mut bytes = Vec::new();
         if let Some(paste) = self.paste.take() {
             bytes.extend_from_slice(START);
@@ -227,9 +265,12 @@ mod tests {
             let mut input = Vec::new();
             for _ in 0..100 {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                match seed % 5 {
+                match seed % 8 {
                     0 => input.extend_from_slice(START),
                     1 => input.extend_from_slice(END),
+                    2 => input.extend_from_slice(b"\x1b]"),
+                    3 => input.extend_from_slice(b"\x1b\\"),
+                    4 => input.push(0x07),
                     _ => input.extend_from_slice(&seed.to_le_bytes()),
                 }
             }
@@ -241,6 +282,35 @@ mod tests {
             out.extend(decoder.flush());
             assert_eq!(out, input);
         }
+    }
+
+    #[test]
+    fn paste_markers_inside_terminal_replies_are_plain_bytes() {
+        for input in [
+            b"\x1b]l\x1b[200~/secret\x1b[201~\x1b\\".as_slice(),
+            b"\x1b]10;\x1b[200~/secret\x1b[201~\x07",
+            b"\x1bP1$r\x1b[200~/secret\x1b[201~\x1b\\",
+        ] {
+            let mut decoder = Decoder::default();
+            assert_eq!(decoder.feed(input), [Part::Bytes(input.to_vec())]);
+            assert!(!decoder.is_pending());
+            assert_eq!(
+                decoder.feed(b"\x1b[200~/a\x1b[201~"),
+                [Part::Paste(b"/a".to_vec())]
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_terminal_string_ends_at_flush() {
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.feed(b"\x1b]"), [Part::Bytes(b"\x1b]".to_vec())]);
+        assert!(decoder.is_pending());
+        assert!(decoder.flush().is_empty());
+        assert_eq!(
+            decoder.feed(b"\x1b[200~/a\x1b[201~"),
+            [Part::Paste(b"/a".to_vec())]
+        );
     }
 
     #[test]
