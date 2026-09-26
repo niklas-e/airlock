@@ -112,6 +112,13 @@ in VS Code.
 VS Code's own source confirms this: its drop handler calls `sendPath` without
 forcing bracketed paste, so the behavior is by design on every platform.
 
+`--monitor` wraps a paste in markers only after it sees the guest enable
+bracketed paste. The scan checked each output chunk on its own. Shells
+re-enable the mode at every prompt, but Claude Code enables it once at
+startup, so a toggle split across two chunks would disable imports for the
+whole session. The scan now carries the last seven bytes of the previous
+chunk.
+
 On WSL, the VS Code terminal drops Windows paths such as
 `'C:\Users\me\shot.png'`, and Airlock forwards them unchanged. Other
 terminals, for example Orca, drop WSL paths, and those imports work. A

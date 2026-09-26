@@ -380,7 +380,7 @@ fn handle_event(
 ) -> anyhow::Result<Option<i32>> {
     match event {
         TuiEvent::Output(data) => {
-            scan_bracketed_paste_mode(&data, &mut app.guest_bracketed_paste);
+            scan_bracketed_paste_mode(&data, &mut app.output_tail, &mut app.guest_bracketed_paste);
             sink.write(&data);
         }
         TuiEvent::Network(ev) => {
@@ -440,18 +440,27 @@ fn handle_event(
 /// shells that don't support it (BusyBox ash) mis-parse the markers and
 /// eat surrounding bytes.
 ///
-/// Doesn't try to handle the sequence being split across chunks: the guest
-/// re-emits on every prompt redraw, so a single miss resolves itself.
-fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
+/// `tail` carries the end of the previous chunk. A shell re-emits the toggle
+/// on every prompt, but full-screen apps such as Claude Code emit it once at
+/// startup, so a toggle split across chunks must not be missed.
+fn scan_bracketed_paste_mode(data: &[u8], tail: &mut Vec<u8>, enabled: &mut bool) {
     const ENABLE: &[u8] = b"\x1b[?2004h";
     const DISABLE: &[u8] = b"\x1b[?2004l";
-    for window in data.windows(ENABLE.len()) {
+    const KEEP: usize = ENABLE.len() - 1;
+    let head = &data[..data.len().min(KEEP)];
+    let boundary = [tail.as_slice(), head].concat();
+    for window in boundary
+        .windows(ENABLE.len())
+        .chain(data.windows(ENABLE.len()))
+    {
         if window == ENABLE {
             *enabled = true;
         } else if window == DISABLE {
             *enabled = false;
         }
     }
+    tail.extend_from_slice(&data[data.len().saturating_sub(KEEP)..]);
+    tail.drain(..tail.len().saturating_sub(KEEP));
 }
 
 /// Handle a key event. Returns `Some(code)` if the TUI should exit.
@@ -785,6 +794,25 @@ fn key_to_bytes(key: KeyEvent, kitty_enabled: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_toggle_split_across_chunks_counts() {
+        let output = b"prompt\x1b[?2004hmore";
+        for split in 0..=output.len() {
+            let (mut tail, mut enabled) = (Vec::new(), false);
+            scan_bracketed_paste_mode(&output[..split], &mut tail, &mut enabled);
+            scan_bracketed_paste_mode(&output[split..], &mut tail, &mut enabled);
+            assert!(enabled, "split at {split}");
+            scan_bracketed_paste_mode(b"\x1b[?20", &mut tail, &mut enabled);
+            scan_bracketed_paste_mode(b"04l", &mut tail, &mut enabled);
+            assert!(!enabled, "split at {split}");
+        }
+        let (mut tail, mut enabled) = (Vec::new(), false);
+        for byte in output {
+            scan_bracketed_paste_mode(&[*byte], &mut tail, &mut enabled);
+        }
+        assert!(enabled);
+    }
 
     /// The hint is transient: visible right after a click, gone once the
     /// window has passed. Checked against the same helper the status line

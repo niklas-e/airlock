@@ -31,6 +31,9 @@ pub struct App {
     /// paste support (BusyBox ash etc.) mis-parse the markers and eat
     /// surrounding bytes.
     pub guest_bracketed_paste: bool,
+    /// End of the previous output chunk, so that a mode switch split across
+    /// two chunks still counts.
+    pub output_tail: Vec<u8>,
     pub settings: TuiSettings,
 }
 
@@ -47,6 +50,7 @@ impl App {
             network,
             select_hint_at: None,
             guest_bracketed_paste: false,
+            output_tail: Vec::new(),
             settings,
         }
     }
