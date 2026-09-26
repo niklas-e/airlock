@@ -7,7 +7,11 @@ use super::*;
 pub(super) fn fixture() -> (tempfile::TempDir, Imports) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/tmp");
     std::fs::create_dir_all(&root).unwrap();
-    let dir = tempfile::tempdir_in(root.canonicalize().unwrap()).unwrap();
+    // The default `.tmp` prefix would make every fixture path hidden.
+    let dir = tempfile::Builder::new()
+        .prefix("attachments-")
+        .tempdir_in(root.canonicalize().unwrap())
+        .unwrap();
     let limits = FileDropLimits {
         file_size: ByteSize(1 << 20),
         total_size: ByteSize(4 << 20),
@@ -172,6 +176,25 @@ fn nested_mounts_map_to_the_most_specific_target() {
     store.rules.mappings[1].source = dir.path().join("elsewhere");
     let shadowed = put(&dir.path().join("sub"), "shadowed.png", b"shadowed");
     assert!(store.import(&[shadowed]).unwrap().starts_with(GUEST_ROOT));
+}
+
+#[test]
+fn hidden_paths_are_mapped_but_never_copied() {
+    let (dir, imports) = fixture();
+    std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+    let key = put(&dir.path().join(".ssh"), "id_ed25519", b"secret");
+    let dotfile = put(dir.path(), ".env", b"secret");
+    let mut store = imports.0.lock();
+    for path in [&key, &dotfile] {
+        assert!(store.import(std::slice::from_ref(path)).is_err(), "{path}");
+    }
+    assert_eq!(store.files, 0);
+    store.rules.mappings.push(Mapping {
+        source: dir.path().to_owned(),
+        target: "/workspace".into(),
+        dir: true,
+    });
+    assert_eq!(store.import(&[dotfile]).unwrap(), "/workspace/.env");
 }
 
 #[test]

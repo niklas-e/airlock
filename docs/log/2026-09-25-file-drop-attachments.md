@@ -42,6 +42,15 @@ false` in `~/.airlock/settings.toml`; project configuration cannot override it.
 Shutdown closes the store even when RPC tasks retain clones. After a crash,
 the next start removes stale copies while holding the project's lock.
 
+## Hidden paths
+
+A paste of a host path imports the file, and the guest can put text on the
+host clipboard with OSC 52 or ask the user for a path. Copies therefore skip
+any path with a dot-prefixed component. This covers `~/.ssh`, `~/.aws`,
+`~/.airlock` (including a plain-text file vault), `~/.cache/airlock`, and the
+`.airlock` directories of other projects. Mapped paths keep working, because
+the guest can already read them through the mount.
+
 ## Known limitations
 
 Terminals send drops and pastes the same way. A pasted absolute host path

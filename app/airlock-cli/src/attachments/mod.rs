@@ -273,6 +273,13 @@ impl Store {
                 outputs.push(Some(quote_path(&mapped.to_string_lossy())));
                 sources.push(None);
             } else {
+                // Secrets such as ~/.ssh keys and airlock state live in hidden paths.
+                if path
+                    .components()
+                    .any(|c| matches!(c, Component::Normal(n) if n.as_bytes().starts_with(b".")))
+                {
+                    bail!("files in hidden paths are not copied");
+                }
                 if metadata.len() > self.limits.file_size.0 {
                     bail!(
                         "file exceeds the {} attachment limit",

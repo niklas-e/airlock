@@ -15,9 +15,10 @@ through an existing mount use that mount when possible. Copied files remain
 available until the sandbox stops. They do not persist for resumed conversations.
 
 > **Warning:** A pasted absolute host path gives the sandbox a copy of that file.
-> Airlock cannot tell a paste from a drop. Do not paste host paths of files that
-> the sandbox must not read. An absolute path that exists both in the sandbox and
-> on the host also changes to the path of the host copy.
+> Airlock cannot tell a paste from a drop. Airlock does not copy hidden paths,
+> but it copies other files. Do not paste host paths of files that the sandbox
+> must not read. An absolute path that exists both in the sandbox and on the
+> host also changes to the path of the host copy.
 
 ## Limits
 
@@ -48,7 +49,9 @@ Project configuration cannot change these limits. Files that an existing
 mount shares do not count against them.
 
 Airlock does not import directories, symlinks, masked files, relative paths,
-or `file://` URLs. A symlink in any parent directory also prevents importing.
+or `file://` URLs. Airlock does not copy files from hidden paths, such as
+`~/.ssh/id_ed25519` or `.env`. A hidden file inside an existing mount keeps
+its guest path. A symlink in any parent directory also prevents importing.
 If an import fails, Airlock forwards the original paste and logs the reason.
 
 Some terminals send a dropped file as typed text, not as a bracketed paste.
