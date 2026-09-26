@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -106,6 +106,7 @@ impl Imports {
             .chain(&rules.hidden)
             .cloned()
             .collect();
+        std::fs::create_dir_all(&parent)?;
         validate_storage(&parent, mounts, &overlays)?;
         clean_bucket(&parent)?;
         let imports = Self::create(&parent, rules, limits)?;
@@ -172,10 +173,11 @@ fn validate_storage(
     mounts: &[ResolvedMount],
     overlays: &[PathBuf],
 ) -> anyhow::Result<()> {
+    let (_, ancestors) = open_path(parent, true).context("open attachment storage")?;
     for mount in mounts {
         // A second, writable alias defeats read-only VirtioFS enforcement.
         let directory = matches!(mount.mount_type, MountType::Dir { .. });
-        if !mount.read_only && directory && parent.starts_with(&mount.source) {
+        if !mount.read_only && directory && is_below(&ancestors, &mount.source) {
             bail!(
                 "attachment storage overlaps writable mount {}",
                 mount.source.display()
@@ -239,8 +241,11 @@ impl Store {
             {
                 bail!("path is masked from the sandbox");
             }
-            let file =
+            let (file, ancestors) =
                 open_path(path, false).context("open dropped file without following symlinks")?;
+            if self.rules.blocked.iter().any(|b| is_below(&ancestors, b)) {
+                bail!("path is masked from the sandbox");
+            }
             let metadata = file.metadata()?;
             if !metadata.is_file() {
                 bail!("only regular files can be attached");
@@ -371,12 +376,27 @@ fn quote_path(path: &str) -> String {
     }
 }
 
+/// Device and inode of a file.
+type FileId = (u64, u64);
+
+fn file_id(metadata: &std::fs::Metadata) -> FileId {
+    (metadata.dev(), metadata.ino())
+}
+
+/// Checks by file identity, because text comparison misses aliases such as
+/// other letter case on case-insensitive file systems.
+fn is_below(ancestors: &[FileId], dir: &Path) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| ancestors.contains(&file_id(&m)))
+}
+
 /// O_NOFOLLOW must cover ancestors too: the guest can replace writable directories.
-fn open_path(path: &Path, directory: bool) -> std::io::Result<File> {
+/// Also returns the identity of every opened component, the root included.
+fn open_path(path: &Path, directory: bool) -> std::io::Result<(File, Vec<FileId>)> {
     if !path.is_absolute() {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let mut file = File::open("/")?;
+    let mut ids = vec![file_id(&file.metadata()?)];
     let components: Vec<_> = path.components().collect();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
@@ -399,8 +419,9 @@ fn open_path(path: &Path, directory: bool) -> std::io::Result<File> {
         }
         // SAFETY: openat returned a new, owned descriptor.
         file = unsafe { File::from_raw_fd(fd) };
+        ids.push(file_id(&file.metadata()?));
     }
-    Ok(file)
+    Ok((file, ids))
 }
 
 #[cfg(test)]

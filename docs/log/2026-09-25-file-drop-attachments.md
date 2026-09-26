@@ -51,6 +51,15 @@ any path with a dot-prefixed component. This covers `~/.ssh`, `~/.aws`,
 `.airlock` directories of other projects. Mapped paths keep working, because
 the guest can already read them through the mount.
 
+## File identity checks
+
+Text comparison of paths misses aliases. On a case-insensitive macOS volume,
+`proj/Secrets` is the masked `proj/secrets`, and a symlinked mask path names
+another directory. The component-wise open records the device and inode of every
+directory on the way. A mask or a writable mount source blocks the path when
+its identity is among them. The text comparison stays for masked paths that do
+not exist yet.
+
 ## Known limitations
 
 Terminals send drops and pastes the same way. A pasted absolute host path

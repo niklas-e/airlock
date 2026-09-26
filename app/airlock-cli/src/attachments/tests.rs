@@ -260,30 +260,48 @@ fn parent_traversal_cannot_bypass_mask_checks() {
 
 #[test]
 fn storage_rejects_writable_aliases_and_overlays_before_boot() {
+    let (dir, _imports) = fixture();
+    let parent = dir.path().join("cache/imports");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir(dir.path().join("project")).unwrap();
+    symlink(dir.path().join("cache"), dir.path().join("alias")).unwrap();
     let mut mount = ResolvedMount {
         mount_type: MountType::Dir {
             key: "project".into(),
         },
-        source: "/host/project".into(),
+        source: dir.path().join("project"),
         target: "/workspace".into(),
         read_only: false,
     };
-    let parent = Path::new("/host/cache/imports");
-    assert!(validate_storage(parent, std::slice::from_ref(&mount), &[]).is_ok());
-    mount.source = "/host".into();
-    assert!(validate_storage(parent, std::slice::from_ref(&mount), &[]).is_err());
+    assert!(validate_storage(&parent, std::slice::from_ref(&mount), &[]).is_ok());
+    for source in [dir.path().to_owned(), dir.path().join("alias")] {
+        mount.source = source;
+        assert!(validate_storage(&parent, std::slice::from_ref(&mount), &[]).is_err());
+    }
     mount.read_only = true;
-    assert!(validate_storage(parent, std::slice::from_ref(&mount), &[]).is_ok());
+    assert!(validate_storage(&parent, std::slice::from_ref(&mount), &[]).is_ok());
     mount.target = GUEST_ROOT.into();
-    assert!(validate_storage(parent, std::slice::from_ref(&mount), &[]).is_err());
+    assert!(validate_storage(&parent, std::slice::from_ref(&mount), &[]).is_err());
     mount.target = "/airlock".into();
     mount.mount_type = MountType::File {
         mount_key: "file".into(),
     };
-    assert!(validate_storage(parent, &[mount], &[]).is_err());
+    assert!(validate_storage(&parent, &[mount], &[]).is_err());
     for target in ["/airlock", GUEST_ROOT, "/airlock/imports/child"] {
-        assert!(validate_storage(parent, &[], &[target.into()]).is_err());
+        assert!(validate_storage(&parent, &[], &[target.into()]).is_err());
     }
+}
+
+#[test]
+fn masks_match_by_identity_not_by_spelling() {
+    let (dir, imports) = fixture();
+    std::fs::create_dir(dir.path().join("masked")).unwrap();
+    let secret = put(&dir.path().join("masked"), "secret.png", b"secret");
+    symlink(dir.path().join("masked"), dir.path().join("alias")).unwrap();
+    let mut store = imports.0.lock();
+    store.rules.blocked.push(dir.path().join("alias"));
+    assert!(store.import(&[secret]).is_err());
+    assert_eq!(store.files, 0);
 }
 
 #[test]
